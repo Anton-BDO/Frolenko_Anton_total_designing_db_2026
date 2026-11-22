@@ -16,17 +16,24 @@
 --   7) order_restaurant_freeze_trg / product_restaurant_freeze_trg — запрет
 --      менять restaurant_id у заказа/блюда, уже имеющего позиции (иначе
 --      существующие позиции нарушили бы BR-7.3 задним числом).
+--   8) order_client_review_guard_trg — запрет менять клиента заказа, если по
+--      нему уже есть отзывы (иначе они нарушат BR-9.2 задним числом).
+--   9) order_structure_review_*_guard_trg — запрет удалять/переносить позицию,
+--      на блюдо которой уже есть отзыв в рамках этого заказа (BR-9.2).
 -- ============================================================================
 SET search_path TO frolenko_food, exts;
 
-DROP TRIGGER IF EXISTS review_rating_change            ON review;
-DROP TRIGGER IF EXISTS review_entity_check_trg         ON review;
-DROP TRIGGER IF EXISTS payment_amount_check_trg        ON payment;
-DROP TRIGGER IF EXISTS payment_pay_status_change_trg   ON payment;
-DROP TRIGGER IF EXISTS order_amount_freeze_trg         ON "order";
-DROP TRIGGER IF EXISTS order_structure_restaurant_trg  ON order_structure;
-DROP TRIGGER IF EXISTS order_restaurant_freeze_trg     ON "order";
-DROP TRIGGER IF EXISTS product_restaurant_freeze_trg   ON product;
+DROP TRIGGER IF EXISTS review_rating_change                  ON review;
+DROP TRIGGER IF EXISTS review_entity_check_trg               ON review;
+DROP TRIGGER IF EXISTS payment_amount_check_trg              ON payment;
+DROP TRIGGER IF EXISTS payment_pay_status_change_trg         ON payment;
+DROP TRIGGER IF EXISTS order_amount_freeze_trg               ON "order";
+DROP TRIGGER IF EXISTS order_structure_restaurant_trg        ON order_structure;
+DROP TRIGGER IF EXISTS order_restaurant_freeze_trg           ON "order";
+DROP TRIGGER IF EXISTS product_restaurant_freeze_trg         ON product;
+DROP TRIGGER IF EXISTS order_client_review_guard_trg         ON "order";
+DROP TRIGGER IF EXISTS order_structure_review_delete_guard   ON order_structure;
+DROP TRIGGER IF EXISTS order_structure_review_update_guard   ON order_structure;
 
 DROP FUNCTION IF EXISTS rating_change();
 DROP FUNCTION IF EXISTS review_entity_check();
@@ -36,6 +43,8 @@ DROP FUNCTION IF EXISTS order_amount_freeze();
 DROP FUNCTION IF EXISTS order_structure_restaurant_check();
 DROP FUNCTION IF EXISTS order_restaurant_freeze();
 DROP FUNCTION IF EXISTS product_restaurant_freeze();
+DROP FUNCTION IF EXISTS order_client_review_guard();
+DROP FUNCTION IF EXISTS order_structure_review_guard();
 
 -- ---------------------------------------------------------------------------
 -- FOOD-105: пересчёт рейтинга при INSERT/UPDATE/DELETE отзыва.
@@ -192,21 +201,29 @@ AS $f$
 DECLARE
     v_order uuid;
 BEGIN
-    v_order := COALESCE(NEW.order_id, OLD.order_id);
-    UPDATE "order" o
-    SET pay_status = (
-        CASE
-            WHEN EXISTS (SELECT 1 FROM payment p
-                         WHERE p.order_id = v_order AND p.status = 'успех')
-                THEN 'оплачен'
-            WHEN NOT EXISTS (SELECT 1 FROM payment p WHERE p.order_id = v_order)
-                THEN 'ожидает'
-            WHEN EXISTS (SELECT 1 FROM payment p
-                         WHERE p.order_id = v_order AND p.status = 'в_обработке')
-                THEN 'ожидает'
-            ELSE 'ошибка'
-        END)::order_pay_status
-    WHERE o.order_id = v_order;
+    -- При переносе попытки через UPDATE order_id затронуты оба заказа.
+    -- DISTINCT исключает повторный пересчёт, если order_id не изменился.
+    FOR v_order IN
+        SELECT affected.order_id
+        FROM unnest(ARRAY[OLD.order_id, NEW.order_id]) AS affected(order_id)
+        WHERE affected.order_id IS NOT NULL
+        GROUP BY affected.order_id
+    LOOP
+        UPDATE "order" o
+        SET pay_status = (
+            CASE
+                WHEN EXISTS (SELECT 1 FROM payment p
+                             WHERE p.order_id = v_order AND p.status = 'успех')
+                    THEN 'оплачен'
+                WHEN NOT EXISTS (SELECT 1 FROM payment p WHERE p.order_id = v_order)
+                    THEN 'ожидает'
+                WHEN EXISTS (SELECT 1 FROM payment p
+                             WHERE p.order_id = v_order AND p.status = 'в_обработке')
+                    THEN 'ожидает'
+                ELSE 'ошибка'
+            END)::order_pay_status
+        WHERE o.order_id = v_order;
+    END LOOP;
 
     IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END;
@@ -306,3 +323,57 @@ $f$;
 CREATE TRIGGER product_restaurant_freeze_trg
     BEFORE UPDATE OF restaurant_id ON product
     FOR EACH ROW EXECUTE FUNCTION product_restaurant_freeze();
+
+-- ---------------------------------------------------------------------------
+-- BR-9.2 «задним числом»: нельзя менять клиента заказа, если по нему уже
+-- есть отзывы. Иначе их client_id перестанет совпадать с клиентом заказа.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION order_client_review_guard() RETURNS trigger
+LANGUAGE plpgsql
+AS $f$
+BEGIN
+    IF NEW.client_id IS DISTINCT FROM OLD.client_id
+       AND EXISTS (SELECT 1 FROM review r WHERE r.order_id = OLD.order_id) THEN
+        RAISE EXCEPTION 'order: нельзя менять клиента заказа %, по нему уже есть отзывы (BR-9.2)', OLD.order_id;
+    END IF;
+    RETURN NEW;
+END;
+$f$;
+
+CREATE TRIGGER order_client_review_guard_trg
+    BEFORE UPDATE OF client_id ON "order"
+    FOR EACH ROW EXECUTE FUNCTION order_client_review_guard();
+
+-- ---------------------------------------------------------------------------
+-- BR-9.2 «задним числом»: позицию нельзя удалить или связать с другим
+-- заказом/блюдом, если на старое блюдо в старом заказе уже есть отзыв.
+-- Обычное изменение quantity разрешено.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION order_structure_review_guard() RETURNS trigger
+LANGUAGE plpgsql
+AS $f$
+BEGIN
+    IF (TG_OP = 'DELETE'
+        OR NEW.order_id IS DISTINCT FROM OLD.order_id
+        OR NEW.product_id IS DISTINCT FROM OLD.product_id)
+       AND EXISTS (
+           SELECT 1 FROM review r
+           WHERE r.order_id = OLD.order_id
+             AND r.entity_type = 'блюдо'
+             AND r.entity_id = OLD.product_id
+       ) THEN
+        RAISE EXCEPTION 'order_structure: нельзя удалить/переносить позицию (%, %), на её блюдо уже есть отзыв (BR-9.2)',
+            OLD.order_id, OLD.product_id;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END;
+$f$;
+
+CREATE TRIGGER order_structure_review_delete_guard
+    BEFORE DELETE ON order_structure
+    FOR EACH ROW EXECUTE FUNCTION order_structure_review_guard();
+
+CREATE TRIGGER order_structure_review_update_guard
+    BEFORE UPDATE OF order_id, product_id ON order_structure
+    FOR EACH ROW EXECUTE FUNCTION order_structure_review_guard();

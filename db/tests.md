@@ -23,7 +23,7 @@
 
 Восстановление: `pg_restore -U postgres -d foodexpress_check --exit-on-error db/foodexpress_frolenko.backup` — без ошибок, код выхода 0.
 
-Факт: восстановлено 12 таблиц (пустых), 16 FK, 8 enum-типов, 4 процедуры + 1 функция + 8 триггер-функций, 8 триггеров, 1 представление; `client` пуста (в бэкапе только структура).
+Факт: восстановлено 12 таблиц (пустых), 16 FK, 8 enum-типов, 4 процедуры + 1 функция + 10 триггер-функций, 11 триггеров, 1 представление; `client` пуста (в бэкапе только структура).
 Вердикт: OK
 
 ### A.2. Переключение на inspector
@@ -224,6 +224,23 @@ SELECT current_user;
 - вставка позиции с блюдом чужого ресторана → отклонена триггером `order_structure_restaurant_check` (BR-7.3);
 - `UPDATE "order" SET restaurant_id = ...` у заказа с позициями → отклонён триггером `order_restaurant_freeze`;
 - `UPDATE product SET restaurant_id = ...` у блюда, входящего в позиции заказов → отклонён триггером `product_restaurant_freeze`.
+
+Вердикт: OK
+
+### E.10. Регрессионные тесты обратных изменений связей
+
+Воспроизводимый файл: `db/regression_tests.sql`. Запуск под `inspector` после восстановления бэкапа и применения `grants.sql`:
+
+```bash
+psql -U inspector -d foodexpress_check -f db/regression_tests.sql
+```
+
+Факт (все проверки пройдены, тестовые изменения откачены):
+
+- перенос успешной попытки оплаты через `UPDATE payment.order_id` → прежний заказ получает `pay_status = 'ожидает'`, новый — `'оплачен'`; у прежнего не остаётся попыток;
+- `UPDATE "order" SET client_id = ...` при существующих отзывах → отклонён триггером `order_client_review_guard` (BR-9.2);
+- `DELETE FROM order_structure` для позиции с отзывом → отклонён триггером `order_structure_review_guard`;
+- `UPDATE order_structure SET product_id = ...` для позиции с отзывом → отклонён тем же триггером; обычное изменение `quantity` не блокируется.
 
 Вердикт: OK
 
