@@ -86,6 +86,11 @@ DECLARE
     v_order_statuses     order_status[];
     v_pay_statuses       payment_status[];
     v_order_pay_statuses order_pay_status[];
+    v_review_types       review_entity_type[];
+    -- периоды работы курьеров: заказ датируется только внутри периода работы
+    -- назначенного курьера (hire_date .. dismissal_date/сегодня)
+    v_hire_dates    date[];
+    v_dismiss_dates date[];
 BEGIN
     IF value IS NULL OR value < 1 THEN
         RAISE EXCEPTION 'insert_test_data: value должно быть >= 1, получено %', value;
@@ -105,6 +110,8 @@ BEGIN
     v_order_statuses     := enum_range(NULL::order_status);
     v_pay_statuses       := enum_range(NULL::payment_status);
     v_order_pay_statuses := enum_range(NULL::order_pay_status);
+    --   review:    1 блюдо, 2 ресторан, 3 заказ
+    v_review_types       := enum_range(NULL::review_entity_type);
 
     -- Базы счётчиков: сколько строк уже есть (генератор работает без очистки)
     SELECT count(*) INTO v_base_client  FROM client;
@@ -153,6 +160,8 @@ BEGIN
                 v_dismiss,
                 0.1)
             RETURNING courier_id INTO v_id;
+            v_hire_dates    := v_hire_dates    || v_hire;
+            v_dismiss_dates := v_dismiss_dates || v_dismiss;
         ELSE
             INSERT INTO courier (fio, phone_number, status, hire_date, coefficient)
             VALUES (
@@ -165,6 +174,8 @@ BEGIN
                 v_hire,
                 0.1)
             RETURNING courier_id INTO v_id;
+            v_hire_dates    := v_hire_dates    || v_hire;
+            v_dismiss_dates := v_dismiss_dates || NULL::date;
         END IF;
         v_courier_ids := v_courier_ids || v_id;
         v_fired  := v_fired  || v_fired_flag;
@@ -276,9 +287,16 @@ BEGIN
         SELECT array_agg(address_id) INTO v_ca
         FROM tmp_fx_client_addr
         WHERE client_id = v_client_ids[v_ci];
-        v_order_ts := localtimestamp
-            - (random() * 180)::int * interval '1 day'
-            - (random() * 86400)::int * interval '1 second';        -- последние 6 мес (samples §4)
+        -- Дата заказа — строго внутри периода работы назначенного курьера
+        -- (hire_date .. dismissal_date или сегодня). hire_date сам в пределах
+        -- 180 дней, поэтому окно автоматически лежит в последних 6 месяцах.
+        v_hire    := v_hire_dates[v_ci];
+        v_dismiss := COALESCE(v_dismiss_dates[v_ci], current_date);
+        v_order_ts := LEAST(
+            v_hire::timestamp
+                + floor(random() * (GREATEST(v_dismiss - v_hire, 0) + 1))::int * interval '1 day'
+                + floor(random() * 86399)::int * interval '1 second',
+            localtimestamp);
         v_status := CASE
             WHEN random() < 0.60 THEN v_order_statuses[4]   -- доставлен
             WHEN random() < 0.70 THEN v_order_statuses[1]   -- создан
@@ -291,7 +309,10 @@ BEGIN
         ELSE
             v_deliv_ts := NULL;
         END IF;
-        v_amount := (1000 + floor(random() * 9000))::numeric(12,2); -- total >= 1100 (BR-1.8, BR-7.11)
+        -- Временная сумма: итог заказа пересчитывается как SUM(price * quantity)
+        -- после вставки позиций (согласованность сумм). 910.00 гарантирует
+        -- total >= 1000 (BR-1.8, BR-7.11) на момент вставки заказа.
+        v_amount := 910.00;
         INSERT INTO "order" (courier_id, client_id, address_id, restaurant_id, order_timestamp,
                              delivery_timestamp, order_amount, status, description)
         VALUES (
@@ -324,12 +345,38 @@ BEGIN
         v_k := 1 + floor(random() * array_length(v_cand, 1))::int;  -- 1..5
         FOR v_j IN 1..v_k LOOP
             v_idx := 1 + floor(random() * array_length(v_cand, 1))::int;
-            INSERT INTO order_structure (order_id, product_id, restaurant_id, quantity)
-            VALUES (v_order_ids[v_i], v_cand[v_idx], v_rest_ids[v_ri],
-                    round((0.5 + random() * 2)::numeric, 3));          -- > 0 (BR-7.15)
+            INSERT INTO order_structure (order_id, product_id, quantity)
+            VALUES (v_order_ids[v_i], v_cand[v_idx],
+                    (1 + floor(random() * 3))::numeric);                -- 1..3, > 0 (BR-7.15)
             -- удалить выбранное блюдо из кандидатов: дубликатов не будет
             v_cand := v_cand[1:v_idx - 1] || v_cand[v_idx + 1:array_length(v_cand, 1)];
         END LOOP;
+    END LOOP;
+
+    -- Согласованность сумм: order_amount = SUM(product.price * quantity)
+    -- позиций заказа. Количества целые, цены — 2 знака, поэтому SUM точна
+    -- до копейки без округлений. Если сумма позиций < 910 (минимум для
+    -- total >= 1000, BR-1.8), добиваем количество первой позиции целыми
+    -- единицами — сумма остаётся точным SUM. Цель 912 с запасом.
+    FOR v_i IN 1..value * 5 LOOP
+        SELECT sum(p.price * os.quantity) INTO v_amount
+        FROM order_structure os
+        JOIN product p ON p.product_id = os.product_id
+        WHERE os.order_id = v_order_ids[v_i];
+        IF v_amount < 910.00 THEN
+            UPDATE order_structure os
+            SET quantity = os.quantity + CEIL((912.00 - v_amount) / p.price)
+            FROM product p
+            WHERE p.product_id = os.product_id
+              AND os.order_id = v_order_ids[v_i]
+              AND os.product_id = (SELECT os2.product_id FROM order_structure os2
+                                   WHERE os2.order_id = v_order_ids[v_i] LIMIT 1);
+            SELECT sum(p.price * os.quantity) INTO v_amount
+            FROM order_structure os
+            JOIN product p ON p.product_id = os.product_id
+            WHERE os.order_id = v_order_ids[v_i];
+        END IF;
+        UPDATE "order" SET order_amount = v_amount WHERE order_id = v_order_ids[v_i];
     END LOOP;
 
     -- payment: value * 5 (BR-11.7, C.3 чек-листа) — ровно одна успешная
@@ -347,7 +394,8 @@ BEGIN
             LEAST((SELECT order_timestamp FROM "order" WHERE order_id = v_order_ids[v_i])
                   + (1 + floor(random() * 30))::int * interval '1 minute', localtimestamp),
             v_pay_statuses[1]);                               -- 'успех'
-        UPDATE "order" SET pay_status = v_order_pay_statuses[2] WHERE order_id = v_order_ids[v_i];  -- 'оплачен', BR-8.7
+        -- order.pay_status пересчитывает триггер payment_pay_status_change
+        -- (BR-8.7, 004_triggers.sql) — вручную не трогаем.
     END LOOP;
 
     -- review: value * 5 (BR-11.7) — один отзыв на заказ. Сущность отзыва —
@@ -367,7 +415,7 @@ BEGIN
                 LEAST((SELECT order_timestamp FROM "order" WHERE order_id = v_order_ids[v_i])
                       + (1 + floor(random() * 72))::int * interval '1 hour', localtimestamp),
                 v_prods[1 + floor(random() * array_length(v_prods, 1))::int],
-                'блюдо',
+                v_review_types[1],                             -- 'блюдо'
                 v_order_ids[v_i],
                 (ARRAY['Всё отлично!', 'Вкусно, но долго.', 'Хорошо.', 'Понравилось.', 'Нормально.'])[1 + floor(random() * 5)::int],
                 CASE WHEN random() < 0.5 THEN NULL ELSE 'https://cdn.foodexpress.ru/img/' || md5(random()::text) || '.jpg' END,
@@ -379,7 +427,7 @@ BEGIN
                 LEAST((SELECT order_timestamp FROM "order" WHERE order_id = v_order_ids[v_i])
                       + (1 + floor(random() * 72))::int * interval '1 hour', localtimestamp),
                 v_rest_ids[v_ri],
-                'ресторан',
+                v_review_types[2],                             -- 'ресторан'
                 v_order_ids[v_i],
                 (ARRAY['Отличный сервис!', 'Неплохо.', 'Заказали ещё раз.', 'Быстро и вкусно.', 'Так себе.'])[1 + floor(random() * 5)::int],
                 CASE WHEN random() < 0.5 THEN NULL ELSE 'https://cdn.foodexpress.ru/img/' || md5(random()::text) || '.jpg' END,
@@ -391,7 +439,7 @@ BEGIN
                 LEAST((SELECT order_timestamp FROM "order" WHERE order_id = v_order_ids[v_i])
                       + (1 + floor(random() * 72))::int * interval '1 hour', localtimestamp),
                 v_order_ids[v_i],
-                'заказ',
+                v_review_types[3],                             -- 'заказ'
                 v_order_ids[v_i],
                 (ARRAY['Доставили вовремя.', 'Курьер вежливый.', 'Всё холодное.', 'Претензий нет.', 'Спасибо!'])[1 + floor(random() * 5)::int],
                 CASE WHEN random() < 0.5 THEN NULL ELSE 'https://cdn.foodexpress.ru/img/' || md5(random()::text) || '.jpg' END,
@@ -540,9 +588,10 @@ DECLARE
     v_mstart  timestamp := date_trunc('month', current_date)::timestamp;
     v_mend    timestamp := date_trunc('month', current_date)::timestamp + interval '1 month';
     v_courier record;
-    v_sum     numeric;
-    v_cnt     int;
-    v_newcoef numeric;
+    v_sum      numeric;
+    v_cnt      int;
+    v_newcoef  numeric;
+    v_coef_eff numeric;
 BEGIN
     FOR v_courier IN SELECT courier_id, coefficient, status FROM courier LOOP
         -- Зарплата = текущий коэффициент × сумма комиссий доставленных
@@ -555,13 +604,23 @@ BEGIN
           AND order_timestamp >= v_mstart
           AND order_timestamp <  v_mend;
 
-        -- Одна запись в месяц: повторный вызов обновляет, а не дублирует
-        -- (BR-10.3). coefficient_used — старый (текущий) коэффициент.
+        -- Идемпотентность: если запись за этот месяц уже есть (повторный
+        -- вызов), сумму пересчитываем по СОХРАНЁННОМУ coefficient_used, а не по
+        -- уже обновлённому courier.coefficient — иначе повторный вызов
+        -- «переоценивал» бы начисленную зарплату новым коэффициентом.
+        SELECT cp.coefficient_used INTO v_coef_eff
+        FROM courier_pay cp
+        WHERE cp.year = v_year AND cp.month = v_month
+          AND cp.courier_id = v_courier.courier_id;
+        v_coef_eff := COALESCE(v_coef_eff, v_courier.coefficient);
+
+        -- Одна запись в месяц: повторный вызов обновляет сумму, а не дублирует
+        -- запись (BR-10.3); coefficient_used первого расчёта сохраняется.
         INSERT INTO courier_pay (year, month, courier_id, amount, coefficient_used)
         VALUES (v_year, v_month, v_courier.courier_id,
-                round(v_courier.coefficient * v_sum, 2), v_courier.coefficient)
+                round(v_coef_eff * v_sum, 2), v_coef_eff)
         ON CONFLICT (year, month, courier_id) DO UPDATE
-            SET amount = EXCLUDED.amount, coefficient_used = EXCLUDED.coefficient_used;
+            SET amount = EXCLUDED.amount;
 
         -- Новый коэффициент на следующий месяц (BR-10.2) — только у
         -- работающих курьеров (BR-10.6)

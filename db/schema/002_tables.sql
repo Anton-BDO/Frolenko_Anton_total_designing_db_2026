@@ -104,11 +104,7 @@ CREATE TABLE product (
     rating              numeric(3,2) NULL
         CONSTRAINT product_rating_check CHECK (rating BETWEEN 0 AND 5),    -- BR-5.4; NULL, пока нет отзывов (BR-9.7). Точность (3,2): хранит ROUND(AVG,2) без квантования (проверка D.14)
     status              product_status NOT NULL DEFAULT 'доступно',        -- BR-5.5
-    description         text NOT NULL,                                     -- BR-5.2
-    -- Цель составного FK для ловушки 3 (BR-7.3): блюдо в заказе строго из
-    -- ресторана заказа. Уникальность (product_id, restaurant_id) требуется
-    -- как целевая для FK из order_structure.
-    CONSTRAINT product_id_restaurant_uq UNIQUE (product_id, restaurant_id)
+    description         text NOT NULL                                      -- BR-5.2
 );
 
 -- ---------------------------------------------------------------------------
@@ -144,8 +140,9 @@ CREATE TABLE "order" (
     -- (client_id, address_id) должна существовать в client_address.
     CONSTRAINT order_client_address_fk
         FOREIGN KEY (client_id, address_id) REFERENCES client_address (client_id, address_id),
-    -- Цель составного FK для ловушки 3 (BR-7.3)
-    CONSTRAINT order_id_restaurant_uq UNIQUE (order_id, restaurant_id)
+    -- BR-7.12: доставленный заказ обязан иметь время окончания доставки
+    CONSTRAINT order_delivered_ts_check
+        CHECK (status <> 'доставлен' OR delivery_timestamp IS NOT NULL)
 );
 
 -- Попытка оплаты заказа. В ERD только (payment_id, order_id) — дополнено
@@ -172,19 +169,13 @@ CREATE UNIQUE INDEX payment_one_success_uq
 CREATE TABLE order_structure (
     order_id      uuid NOT NULL REFERENCES "order" (order_id) ON DELETE RESTRICT,   -- BR-7.14
     product_id    uuid NOT NULL REFERENCES product (product_id) ON DELETE RESTRICT, -- BR-7.14
-    -- restaurant_id позиции: техническая колонка для составных FK (ловушка 3).
-    -- Дублирует restaurant_id заказа/блюда, но по ней строятся ограничения.
-    restaurant_id uuid NOT NULL,
     quantity      numeric(8,3) NOT NULL
         CONSTRAINT order_structure_quantity_check CHECK (quantity > 0),  -- BR-7.15
-    PRIMARY KEY (order_id, product_id),                                  -- BR-7.16
-    -- Ловушка 3 (BR-7.3): пара (order_id, restaurant_id) обязана совпадать
-    -- с рестораном заказа, пара (product_id, restaurant_id) — с рестораном
-    -- блюда. Вместе они декларативно запрещают блюда чужого ресторана.
-    CONSTRAINT order_structure_order_restaurant_fk
-        FOREIGN KEY (order_id, restaurant_id) REFERENCES "order" (order_id, restaurant_id),
-    CONSTRAINT order_structure_product_restaurant_fk
-        FOREIGN KEY (product_id, restaurant_id) REFERENCES product (product_id, restaurant_id)
+    PRIMARY KEY (order_id, product_id)                                   -- BR-7.16
+    -- Ловушка 3 (BR-7.3, блюда только из ресторана заказа) решается триггером
+    -- order_structure_restaurant_check (004_triggers.sql). Колонка-«якорь»
+    -- restaurant_id здесь создавала бы частичную зависимость неключевого
+    -- атрибута от частей составного PK — то есть нарушение 2НФ.
 );
 
 -- Отзыв (BR-9.1–BR-9.5). entity_id — полиморфная ссылка: одним FK нельзя
