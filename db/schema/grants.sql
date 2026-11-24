@@ -35,10 +35,3 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA exts TO inspector;
 
 -- Удобство: search_path по умолчанию (проверки A.2/G.5 опираются на него)
 ALTER USER inspector SET search_path TO frolenko_food, exts;
-
--- На будущее: права inspector распространяются и на объекты, которые будут
--- созданы в схеме после выдачи прав (стандартная практика; для приёмки
--- не требуется — все объекты уже существуют и покрыты GRANT выше).
-ALTER DEFAULT PRIVILEGES IN SCHEMA frolenko_food GRANT ALL ON TABLES TO inspector;
-ALTER DEFAULT PRIVILEGES IN SCHEMA frolenko_food GRANT ALL ON FUNCTIONS TO inspector;
-ALTER DEFAULT PRIVILEGES IN SCHEMA frolenko_food GRANT ALL ON SEQUENCES TO inspector;

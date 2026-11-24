@@ -1,20 +1,16 @@
 # FoodExpress — база данных
 
-Добро пожаловать в проект. Твоя задача — спроектировать и реализовать базу данных для сервиса доставки еды.
+Решение: схема `frolenko_food` (12 таблиц), генератор тестовых данных, процедуры, триггеры, функции, представление, бэкап — по [бэклогу](docs/backlog.md) FOOD-101…FOOD-110. Требования к сдаче — в [docs/acceptance.md](docs/acceptance.md).
 
 ## С чего начать
-1. Прочитай [онбординг](docs/onboarding.md) — это твой первый рабочий день.
+1. Прочитай [онбординг](docs/onboarding.md).
 2. Изучи [бизнес-правила](docs/company-rules.md).
-3. Открой [бэклог](docs/backlog.md) — там твои задачи.
 
-## Если ты никогда не работал с Git
-1. Посмотри [скринкаст](docs/git-screencast.md) (10 минут).
-2. Держи под рукой [шпаргалку](docs/git-cheatsheet.md).
-
-## Сдача работы
-Все требования к составу файлов, формату резервной копии и процессу сдачи описаны в файле [docs/acceptance.md](docs/acceptance.md).
-
-## Платформы
-Репозиторий зеркалируется на две платформы. Форкай ту, где тебе удобнее:
-- GitHub: [`<ссылка_на_github>`](https://github.com/NKhashchanov/total_designing_db_2026)
-- GitVerse: [`<ссылка_на_gitverse>`](https://gitverse.ru/nkhashchanov/total_designing_db_2026)
+## Запуск
+```bash
+createdb foodexpress_check
+psql -d foodexpress_check -c "CREATE SCHEMA exts; CREATE EXTENSION \"uuid-ossp\" WITH SCHEMA exts;"
+pg_restore -d foodexpress_check --no-owner --no-privileges db/foodexpress_frolenko.backup
+psql -d foodexpress_check -f db/schema/grants.sql
+psql -d foodexpress_check -c "CALL frolenko_food.insert_test_data(10);"
+```
